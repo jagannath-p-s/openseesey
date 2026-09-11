@@ -55,7 +55,6 @@ def main() -> int:
 
     ring = RingWindow()
     overlay = Overlay()
-    vanish.set_curtain_hooks(overlay.show_curtain, overlay.hide_curtain)
 
     def toggle() -> None:
         if ring.is_armed():
@@ -83,7 +82,6 @@ def main() -> int:
 
     ring.clicked.connect(toggle)
     overlay.closed.connect(on_disarm)
-    overlay.ring_move_requested.connect(ring.set_position)
 
     app.installEventFilter(_KeyFilter(on_escape, on_quit))
 

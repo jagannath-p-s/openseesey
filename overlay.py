@@ -1,10 +1,10 @@
-"""Fullscreen overlay — gestures, light portal cursor, vanish."""
+"""Fullscreen overlay — gestures, portal cursor, vanish."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QCursor,
@@ -24,6 +24,7 @@ import audit
 import gesture_engine
 import hit_tester
 import icon_registry
+import sfx
 import vanish
 from sparks import SparkEngine
 from state import GestureResult, SlingIconHit
@@ -33,9 +34,21 @@ CURSOR_SPRITE_SIZE = 28
 DESKTOP = Path.home() / "Desktop"
 
 
+class _SummonWorker(QThread):
+    done = Signal(object)
+
+    def __init__(self, portal_cx: float, portal_cy: float) -> None:
+        super().__init__()
+        self._portal_cx = portal_cx
+        self._portal_cy = portal_cy
+
+    def run(self) -> None:
+        name = vanish.reveal_next_at(DESKTOP, self._portal_cx, self._portal_cy)
+        self.done.emit(name)
+
+
 class Overlay(QWidget):
     closed = Signal()
-    ring_move_requested = Signal(int, int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -44,11 +57,12 @@ class Overlay(QWidget):
         self._gesture_local: list[QPointF] = []
         self._last_local: list[QPointF] = []
         self._last_result: GestureResult | None = None
-        self._last_hit_name = ""
         self._fade = 0.0
         self._toast = ""
         self._toast_timer = 0.0
-        self._trail_tick = 0
+        self._stroke_step = 0
+        self._summon_busy = False
+        self._summon_worker: _SummonWorker | None = None
         self._engine = SparkEngine()
         self._ring_pixmap = QPixmap(str(ASSET_DIR / "appicon.png"))
 
@@ -64,18 +78,12 @@ class Overlay(QWidget):
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(33)
+        self._timer.start(16)
 
         icon_registry.on_ready(self.update)
 
     def is_armed(self) -> bool:
         return self._armed
-
-    def show_curtain(self) -> None:
-        pass
-
-    def hide_curtain(self) -> None:
-        pass
 
     def arm(self) -> None:
         screen = QGuiApplication.primaryScreen()
@@ -89,14 +97,16 @@ class Overlay(QWidget):
         self.raise_()
         self.activateWindow()
         self.setFocus()
-        self.setFocus()
         self.update()
 
     def disarm(self) -> None:
+        if self._summon_worker and self._summon_worker.isRunning():
+            self._summon_worker.wait(2000)
         vanish.reveal_all(DESKTOP)
         QGuiApplication.restoreOverrideCursor()
         self._armed = False
         self._drawing = False
+        self._summon_busy = False
         self._gesture_local.clear()
         self._engine.set_cursor(QPointF(), active=False)
         self._engine.clear_trail_anchor()
@@ -105,7 +115,7 @@ class Overlay(QWidget):
 
     def _tick(self) -> None:
         if self._fade > 0:
-            self._fade = max(0.0, self._fade - 0.016)
+            self._fade = max(0.0, self._fade - 0.018)
         if self._toast_timer > 0:
             self._toast_timer = max(0.0, self._toast_timer - 0.016)
             if self._toast_timer <= 0:
@@ -113,18 +123,23 @@ class Overlay(QWidget):
 
         cur = self.mapFromGlobal(QCursor.pos())
         self._engine.set_cursor(QPointF(cur), active=self._armed)
-        if self._armed and not self._drawing:
-            self._trail_tick += 1
-            if self._trail_tick % 2 == 0:
-                self._engine.spawn_trail(cur.x(), cur.y())
-
         self._engine.tick()
         if self._armed:
             self.update()
 
-    def _toast_show(self, msg: str, seconds: float = 2.5) -> None:
+    def _toast_show(self, msg: str, seconds: float = 2.2) -> None:
         self._toast = msg
         self._toast_timer = seconds
+
+    def _portal_local(self, result: GestureResult) -> QPointF:
+        gp = QPoint(int(result.centroid_x), int(result.centroid_y))
+        lp = self.mapFromGlobal(gp)
+        return QPointF(lp)
+
+    def _celebrate_circle(self, result: GestureResult) -> None:
+        lc = self._portal_local(result)
+        self._engine.trigger_circle_burst(lc.x(), lc.y(), result.radius)
+        sfx.play_circle_chime()
 
     def _draw_cursor_sprite(self, painter: QPainter) -> None:
         if self._ring_pixmap.isNull():
@@ -154,13 +169,9 @@ class Overlay(QWidget):
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Calibrating desktop icons…")
 
         if self._fade > 0 and len(self._last_local) > 1:
-            alpha = int(200 * self._fade / 1.8)
-            ok = self._last_result and self._last_result.is_circle
-            pen = QPen(
-                QColor(255, 215, 50, alpha) if ok else QColor(255, 90, 80, alpha),
-                3,
-                Qt.PenStyle.DashLine,
-            )
+            alpha = int(180 * self._fade / 1.6)
+            pen = QPen(QColor(255, 215, 50, alpha), 3, Qt.PenStyle.SolidLine)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             p.setPen(pen)
             path = QPainterPath()
             path.moveTo(self._last_local[0])
@@ -169,29 +180,13 @@ class Overlay(QWidget):
             p.drawPath(path)
 
             if self._last_result:
-                lc = self.mapFromGlobal(
-                    QPoint(
-                        int(self._last_result.centroid_x),
-                        int(self._last_result.centroid_y),
-                    )
-                )
+                lc = self._portal_local(self._last_result)
                 r = max(20.0, self._last_result.radius)
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawEllipse(QRectF(lc.x() - r, lc.y() - r, r * 2, r * 2))
-                label = self._last_hit_name or (
-                    "empty space" if ok else self._last_result.reason
-                )
-                p.drawText(
-                    int(lc.x() - 100),
-                    int(lc.y() + r + 8),
-                    200,
-                    20,
-                    Qt.AlignmentFlag.AlignCenter,
-                    f"→ {label}",
-                )
 
         if len(self._gesture_local) > 1:
-            pen = QPen(QColor(255, 215, 50, 240), 4)
+            pen = QPen(QColor(255, 215, 50, 230), 4)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             p.setPen(pen)
             path = QPainterPath()
@@ -201,7 +196,6 @@ class Overlay(QWidget):
             p.drawPath(path)
 
         self._engine.draw(p)
-
         self._draw_cursor_sprite(p)
 
         if self._toast:
@@ -214,34 +208,28 @@ class Overlay(QWidget):
             p.setPen(QColor(255, 235, 180))
             p.drawText(tr, Qt.AlignmentFlag.AlignCenter, self._toast)
 
-        icons = icon_registry.current_icons()
-        p.setFont(QFont("Sans", 9))
-        p.setPen(QColor(255, 200, 100, 200))
-        ready = "ready" if icon_registry.calibration_ready() else "calibrating"
-        hidden_n = len(vanish.session_hidden())
-        p.drawText(
-            16,
-            self.height() - 16,
-            f"OpenSesame · {ready} · {len(icons)} icons · {hidden_n} stashed · Esc restore+exit · Q quit",
-        )
-
         p.end()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if not self._armed or event.button() != Qt.MouseButton.LeftButton:
             return
         if not icon_registry.calibration_ready():
-            if not icon_registry.calibration_ready():
-                self._toast_show("⏳ Still calibrating…")
+            self._toast_show("⏳ Still calibrating…")
             return
         self._drawing = True
+        self._stroke_step = 0
         self._gesture_local = [event.position()]
+        self._engine.spawn_stroke_spark(event.position().x(), event.position().y())
         event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._drawing:
-            self._gesture_local.append(event.position())
-            event.accept()
+        if not self._drawing:
+            return
+        self._gesture_local.append(event.position())
+        self._stroke_step += 1
+        if self._stroke_step % 2 == 0:
+            self._engine.spawn_stroke_spark(event.position().x(), event.position().y())
+        event.accept()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if not self._drawing or event.button() != Qt.MouseButton.LeftButton:
@@ -256,8 +244,7 @@ class Overlay(QWidget):
             return
 
         self._last_local = list(self._gesture_local)
-        self._fade = 1.8
-        self._last_hit_name = ""
+        self._fade = 1.6
 
         screen_pts = [
             (
@@ -276,18 +263,16 @@ class Overlay(QWidget):
 
         if not icon_registry.calibration_ready():
             self._toast_show("⏳ Calibration still running…")
-            audit.log_action("GESTURE_DEFERRED", "reason=calibration_not_ready")
             return
 
+        self._celebrate_circle(result)
+
         had_stashed = bool(vanish.session_hidden())
-        icon_registry.rescan_desktop()
         hit = hit_tester.resolve_hit(result, icon_registry.current_icons())
 
         if isinstance(hit, SlingIconHit):
-            self._last_hit_name = hit.name
             QApplication.clipboard().setText(hit.path)
             audit.log_action("COPIED_TO_CLIPBOARD", f"name='{hit.name}' path='{hit.path}'")
-
             filename = Path(hit.path).name
             if vanish.hide_icon(DESKTOP, filename):
                 audit.log_action("VANISH_OK", f"name={hit.name} path={hit.path}")
@@ -297,16 +282,26 @@ class Overlay(QWidget):
             return
 
         if had_stashed:
-            self._last_hit_name = "summon"
-            name = vanish.reveal_next_at(DESKTOP, result.centroid_x, result.centroid_y)
-            if name:
-                self._toast_show(f"Summoned {name} at portal")
-            else:
-                self._toast_show("Summon failed")
+            if self._summon_busy:
+                self._toast_show("Summon already in progress…")
+                return
+            self._summon_busy = True
+            self._toast_show("Summoning…", seconds=8.0)
+            worker = _SummonWorker(result.centroid_x, result.centroid_y)
+            worker.done.connect(self._on_summon_done)
+            self._summon_worker = worker
+            worker.start()
             return
 
-        self._last_hit_name = "miss"
         self._toast_show("No icon in the circle — draw around a desktop icon")
+
+    def _on_summon_done(self, name: object) -> None:
+        self._summon_busy = False
+        if name:
+            audit.log_action("RESTORE_UI", f"name={name}")
+            self._toast_show(f"Summoned {name}")
+        else:
+            self._toast_show("Summon failed")
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() == Qt.Key.Key_Escape and self._armed:

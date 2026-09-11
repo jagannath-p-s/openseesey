@@ -113,7 +113,7 @@ def reload_ding() -> bool:
             timeout=10,
             check=False,
         )
-        time.sleep(0.35)
+        time.sleep(0.15)
         r_enable = subprocess.run(
             [_GNOME_EXT, "enable", ext_id],
             capture_output=True,
@@ -166,10 +166,10 @@ def _atspi_available() -> bool:
     return _atspi_works
 
 
-def wait_for_ding_ready(timeout_s: float = 4.0, min_icons: int = 1) -> bool:
+def wait_for_ding_ready(timeout_s: float = 3.0, min_icons: int = 1) -> bool:
     """Poll until DING has repainted — GIO scan (fast), AT-SPI when available."""
     deadline = time.monotonic() + timeout_s
-    time.sleep(0.35)
+    time.sleep(0.08)
     while time.monotonic() < deadline:
         gio_count = _count_visible_icons()
         if gio_count >= min_icons:
@@ -186,7 +186,7 @@ def wait_for_ding_ready(timeout_s: float = 4.0, min_icons: int = 1) -> bool:
                 _rebuild_registry()
                 return True
 
-        time.sleep(0.12)
+        time.sleep(0.05)
 
     audit.log_debug("DING", f"wait timeout min_icons={min_icons}")
     return False

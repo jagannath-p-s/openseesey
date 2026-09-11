@@ -21,10 +21,6 @@ _session: dict[str, dict] = {}
 _hide_queue: deque[str] = deque()
 
 
-def set_curtain_hooks(show, hide) -> None:
-    """No-op — curtain removed; reload flash is brief and acceptable on restore only."""
-
-
 def _ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     STASH_DIR.mkdir(parents=True, exist_ok=True)
@@ -95,15 +91,14 @@ def _rollback_to_stash(dst: Path, stash: Path) -> None:
     icon_registry.rescan_desktop()
 
 
-def _ding_place(dst: Path, gio_x: int, gio_y: int, *, attempts: int = 3) -> tuple[int, int] | None:
+def _ding_place(dst: Path, gio_x: int, gio_y: int, *, attempts: int = 2) -> tuple[int, int] | None:
     """Write metadata, reload DING, return live gio readback (retries on mismatch)."""
     final: tuple[int, int] | None = None
     for attempt in range(1, attempts + 1):
-        icon_registry.set_icon_position_and_wait(str(dst), gio_x, gio_y)
+        icon_registry.set_icon_position(str(dst), gio_x, gio_y)
         expected = max(1, len(icon_registry.current_icons()))
         if not _apply_ding_reload(min_icons=expected):
             return None
-        time.sleep(0.15)
         final = icon_registry.get_gio_position(str(dst), live=True)
         if final == (gio_x, gio_y):
             return final
@@ -131,7 +126,6 @@ def _restore_via_gio(
 
         # Overwrite stale xattr from the pre-stash desktop path before DING sees the file.
         icon_registry.set_icon_position(str(dst), gio_x, gio_y)
-        time.sleep(0.08)
         final = _ding_place(dst, gio_x, gio_y)
 
         ok = final == (gio_x, gio_y)
