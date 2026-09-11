@@ -1,4 +1,4 @@
-"""Desktop icon registry — GIO positions, AT-SPI calibration, FileMonitor."""
+"""Desktop icon registry — GIO positions, AT-SPI calibration, DING reload."""
 
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ from state import ICON_H, ICON_W, IconInfo
 DESKTOP = Path.home() / "Desktop"
 CALIB_CACHE = Path.home() / ".config" / "opensesame" / "calib.json"
 _GIO = shutil.which("gio") or "gio"
+_GNOME_EXT = shutil.which("gnome-extensions") or "gnome-extensions"
+_DING_UUID = "ding@rastersoft.com"
 
 GRID_ORIGIN_X = 2
 GRID_ORIGIN_Y = 31
@@ -77,6 +79,117 @@ _ready = False
 _calibration_ready = False
 _listeners: list[Callable[[], None]] = []
 _ready_listeners: list[Callable[[], None]] = []
+_restore_lock = threading.Lock()
+
+
+def ding_extension_id() -> str:
+    """Resolve installed DING extension UUID (fallback to packaged default)."""
+    try:
+        r = subprocess.run(
+            [_GNOME_EXT, "list"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                if "ding" in line.lower():
+                    return line.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return _DING_UUID
+
+
+def reload_ding() -> bool:
+    """Force DING full reload — only reliable path for metadata placement."""
+    ext_id = ding_extension_id()
+    audit.log_debug("DING", f"reload start id={ext_id}")
+    try:
+        r_disable = subprocess.run(
+            [_GNOME_EXT, "disable", ext_id],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        time.sleep(0.35)
+        r_enable = subprocess.run(
+            [_GNOME_EXT, "enable", ext_id],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        ok = r_disable.returncode == 0 and r_enable.returncode == 0
+        audit.log_debug(
+            "DING",
+            f"reload done ok={ok} disable={r_disable.returncode} enable={r_enable.returncode}",
+        )
+        if not ok:
+            audit.log_debug(
+                "DING",
+                f"reload stderr disable={r_disable.stderr.strip()} enable={r_enable.stderr.strip()}",
+            )
+        return ok
+    except (OSError, subprocess.TimeoutExpired) as err:
+        audit.log_debug("DING", f"reload error: {err}")
+        return False
+
+
+def _count_visible_icons() -> int:
+    """Fast count of non-hidden desktop entries (DING shows one icon per entry)."""
+    hidden = _hidden_filenames()
+    return sum(
+        1 for entry in DESKTOP.iterdir()
+        if not entry.name.startswith(".") and entry.name not in hidden
+    )
+
+
+_atspi_works: bool | None = None
+
+
+def _atspi_available() -> bool:
+    global _atspi_works
+    if _atspi_works is not None:
+        return _atspi_works
+    try:
+        r = subprocess.run(
+            ["/usr/bin/python3", "-c", _ATSPI_SCRIPT],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        _atspi_works = r.returncode == 0 and bool(r.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        _atspi_works = False
+    if not _atspi_works:
+        audit.log_debug("DING", "AT-SPI unavailable — using gio scan for ready checks")
+    return _atspi_works
+
+
+def wait_for_ding_ready(timeout_s: float = 4.0, min_icons: int = 1) -> bool:
+    """Poll until DING has repainted — GIO scan (fast), AT-SPI when available."""
+    deadline = time.monotonic() + timeout_s
+    time.sleep(0.35)
+    while time.monotonic() < deadline:
+        gio_count = _count_visible_icons()
+        if gio_count >= min_icons:
+            audit.log_debug("DING", f"ready via gio scan icons={gio_count} min={min_icons}")
+            _rebuild_registry()
+            return True
+
+        if _atspi_available():
+            atspi = _run_atspi()
+            if len(atspi) >= min_icons:
+                global _atspi_rects
+                _atspi_rects = atspi
+                audit.log_debug("DING", f"ready icons={len(atspi)} min={min_icons}")
+                _rebuild_registry()
+                return True
+
+        time.sleep(0.12)
+
+    audit.log_debug("DING", f"wait timeout min_icons={min_icons}")
+    return False
 
 
 def _hidden_filenames() -> set[str]:
@@ -122,24 +235,26 @@ def calibration_ready() -> bool:
     return _calibration_ready
 
 
+def restore_guard() -> threading.Lock:
+    """Held during stash→desktop restore so file-monitor events don't race placement."""
+    return _restore_lock
+
+
 def refresh_after_hidden_change() -> None:
     _rebuild_registry()
     _notify()
 
 
 def rescan_desktop() -> None:
-    """Force a full desktop icon rescan after stash/restore moves."""
     _rebuild_registry()
     _notify()
 
 
 def gio_to_screen(gx: float, gy: float, w: float = ICON_W, h: float = ICON_H) -> tuple[float, float, float, float]:
-    """Single source of truth: gio top-left → screen top-left."""
     return gx + _cal_dx, gy + _cal_dy, w, h
 
 
 def screen_to_gio(sx: float, sy: float) -> tuple[int, int]:
-    """Single source of truth: screen top-left → gio top-left."""
     return int(round(sx - _cal_dx)), int(round(sy - _cal_dy))
 
 
@@ -284,12 +399,13 @@ def _save_calib_cache() -> None:
 
 
 def _calibrate() -> None:
-    global _cal_dx, _cal_dy, _atspi_rects, _calibration_ready
+    global _cal_dx, _cal_dy, _atspi_rects, _calibration_ready, _atspi_works
 
     audit.log_debug("CALIB", f"refining offset (cached {_cal_dx:.1f},{_cal_dy:.1f})")
 
     atspi = _run_atspi()
     _atspi_rects = atspi
+    _atspi_works = bool(atspi)
     if not atspi:
         audit.log_debug("CALIB", "AT-SPI unavailable — keeping cached offset")
         _rebuild_registry(log=True)
@@ -324,6 +440,9 @@ def _calibrate() -> None:
 
 
 def _on_file_changed(file_path: str) -> None:
+    if _restore_lock.locked():
+        return
+
     path = Path(file_path)
     if path.name in _hidden_filenames():
         with _lock:
@@ -388,7 +507,13 @@ def current_icons() -> list[IconInfo]:
     return _dedupe(icons)
 
 
-def get_gio_position(path: str) -> tuple[int, int] | None:
+def get_gio_position(path: str, *, live: bool = False) -> tuple[int, int] | None:
+    if live:
+        gio = _read_gio(Path(path))
+        if gio is None:
+            return None
+        return int(gio[0]), int(gio[1])
+
     with _lock:
         info = _registry.get(path)
     if info is None:
@@ -400,7 +525,6 @@ def get_gio_position(path: str) -> tuple[int, int] | None:
 
 
 def gio_move(src: Path | str, dst: Path | str) -> bool:
-    """Move via gio so GVFS metadata migrates with the file."""
     try:
         r = subprocess.run(
             [_GIO, "move", str(src), str(dst)],
@@ -447,38 +571,20 @@ def set_icon_position(path: str, gio_x: int, gio_y: int) -> bool:
         return False
 
 
-def wait_for_position_settle(
-    path: str,
-    target_x: int,
-    target_y: int,
-    min_settle_s: float = 0.2,
-    timeout_s: float = 2.5,
-) -> bool:
-    t0 = time.monotonic()
-    deadline = t0 + timeout_s
-    while time.monotonic() < deadline:
-        pos = get_gio_position(path)
-        if pos == (target_x, target_y) and time.monotonic() - t0 >= min_settle_s:
-            return True
-        time.sleep(0.05)
-    return get_gio_position(path) == (target_x, target_y)
-
-
 def set_icon_position_and_wait(path: str, gio_x: int, gio_y: int) -> tuple[bool, tuple[int, int] | None]:
-    """Write gio position and confirm via re-read."""
+    """Write gio position and confirm metadata via live re-read (pre-reload check)."""
     if not set_icon_position(path, gio_x, gio_y):
         return False, None
-    settled = wait_for_position_settle(path, gio_x, gio_y)
-    confirmed = get_gio_position(path)
+    confirmed = get_gio_position(path, live=True)
     if confirmed:
         sx, sy, _, _ = gio_to_screen(float(confirmed[0]), float(confirmed[1]))
         audit.log_debug(
             "GIO",
-            f"confirmed path={Path(path).name} intended=({gio_x},{gio_y}) "
-            f"read={confirmed} screen=({sx:.0f},{sy:.0f}) settled={settled} "
-            f"cal=({_cal_dx:.1f},{_cal_dy:.1f})",
+            f"metadata path={Path(path).name} intended=({gio_x},{gio_y}) "
+            f"read={confirmed} screen=({sx:.0f},{sy:.0f}) cal=({_cal_dx:.1f},{_cal_dy:.1f})",
         )
-    return settled, confirmed
+    meta_ok = confirmed == (gio_x, gio_y)
+    return meta_ok, confirmed
 
 
 _OFFSCREEN_MIN = 50000
@@ -505,15 +611,6 @@ def occupied_cells(exclude_path: str = "") -> set[tuple[int, int]]:
             continue
         cells.add(cell_from_gio(icon.gio_x, icon.gio_y))
     return cells
-
-
-def _occupies_nearby(gx: int, gy: int, exclude_path: str, tolerance: float = 40.0) -> bool:
-    for icon in current_icons():
-        if icon.path == exclude_path:
-            continue
-        if math.hypot(icon.gio_x - gx, icon.gio_y - gy) < tolerance:
-            return True
-    return False
 
 
 def _snap_to_free_cell(naive_x: int, naive_y: int, exclude_path: str) -> tuple[int, int]:
@@ -551,11 +648,41 @@ def resolve_target_gio(
     icon_h: float,
     exclude_path: str,
 ) -> tuple[int, int]:
-    """Map portal center to a DING grid cell (DING only honors grid-aligned gio values)."""
+    """Pick the free grid cell whose icon center lands closest to the portal."""
     top_left_sx = portal_cx - icon_w / 2
     top_left_sy = portal_cy - icon_h / 2
     naive_gx, naive_gy = screen_to_gio(top_left_sx, top_left_sy)
-    return _snap_to_free_cell(naive_gx, naive_gy, exclude_path)
+    naive_col, naive_row = cell_from_gio(float(naive_gx), float(naive_gy))
+    taken = occupied_cells(exclude_path)
+
+    best: tuple[int, int] | None = None
+    best_dist = float("inf")
+    for radius in range(0, 10):
+        for dc in range(-radius, radius + 1):
+            for dr in range(-radius, radius + 1):
+                if radius > 0 and abs(dc) != radius and abs(dr) != radius:
+                    continue
+                c, r = naive_col + dc, naive_row + dr
+                if (c, r) in taken:
+                    continue
+                gx, gy = gio_for_cell(c, r)
+                sx, sy, _, _ = gio_to_screen(float(gx), float(gy))
+                icx = sx + icon_w / 2
+                icy = sy + icon_h / 2
+                dist = math.hypot(portal_cx - icx, portal_cy - icy)
+                if dist < best_dist:
+                    best_dist = dist
+                    best = (gx, gy)
+
+    if best is None:
+        best = _snap_to_free_cell(naive_gx, naive_gy, exclude_path)
+
+    audit.log_debug(
+        "GIO",
+        f"portal=({portal_cx:.0f},{portal_cy:.0f}) gio={best[0]},{best[1]} "
+        f"center_dist={best_dist:.0f} cal=({_cal_dx:.1f},{_cal_dy:.1f})",
+    )
+    return best
 
 
 def _prefetch_gio() -> None:
@@ -582,7 +709,6 @@ def _prefetch_gio() -> None:
 
 
 def start() -> None:
-    """Load gio cache, become ready quickly, refine calibration in background."""
     global _cal_dx, _cal_dy
 
     audit.log_debug("DING", "icon_registry starting")

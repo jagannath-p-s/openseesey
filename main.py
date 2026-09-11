@@ -55,6 +55,7 @@ def main() -> int:
 
     ring = RingWindow()
     overlay = Overlay()
+    vanish.set_curtain_hooks(overlay.show_curtain, overlay.hide_curtain)
 
     def toggle() -> None:
         if ring.is_armed():

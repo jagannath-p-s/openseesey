@@ -1,9 +1,7 @@
-"""Fullscreen overlay — gestures, portal cursor, vanish illusion."""
+"""Fullscreen overlay — gestures, light portal cursor, vanish."""
 
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
@@ -26,33 +24,13 @@ import audit
 import gesture_engine
 import hit_tester
 import icon_registry
-import state
 import vanish
-from ring_window import RING_SIZE
 from sparks import SparkEngine
-from state import MoveRingHit, SlingIconHit
+from state import GestureResult, SlingIconHit
 
 ASSET_DIR = Path(__file__).resolve().parent
 CURSOR_SPRITE_SIZE = 28
 DESKTOP = Path.home() / "Desktop"
-
-
-@dataclass
-class _Sprite:
-    pixmap: QPixmap
-    icon_w: float
-    icon_h: float
-    src_x: float
-    src_y: float
-    dst_cx: float
-    dst_cy: float
-    cur_cx: float = 0.0
-    cur_cy: float = 0.0
-    hit_name: str = ""
-    hit_path: str = ""
-    fly_start: float = 0.0
-    fly_duration: float = 0.26
-    vanished: bool = False
 
 
 class Overlay(QWidget):
@@ -65,12 +43,12 @@ class Overlay(QWidget):
         self._drawing = False
         self._gesture_local: list[QPointF] = []
         self._last_local: list[QPointF] = []
-        self._last_result: state.GestureResult | None = None
+        self._last_result: GestureResult | None = None
         self._last_hit_name = ""
         self._fade = 0.0
         self._toast = ""
         self._toast_timer = 0.0
-        self._sprite: _Sprite | None = None
+        self._trail_tick = 0
         self._engine = SparkEngine()
         self._ring_pixmap = QPixmap(str(ASSET_DIR / "appicon.png"))
 
@@ -86,16 +64,18 @@ class Overlay(QWidget):
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(16)
+        self._timer.start(33)
 
-        icon_registry.on_updated(self.update)
         icon_registry.on_ready(self.update)
 
     def is_armed(self) -> bool:
         return self._armed
 
-    def _busy(self) -> bool:
-        return self._sprite is not None
+    def show_curtain(self) -> None:
+        pass
+
+    def hide_curtain(self) -> None:
+        pass
 
     def arm(self) -> None:
         screen = QGuiApplication.primaryScreen()
@@ -109,8 +89,7 @@ class Overlay(QWidget):
         self.raise_()
         self.activateWindow()
         self.setFocus()
-        cur = self.mapFromGlobal(QCursor.pos())
-        self._engine.trigger_portal_burst(cur.x(), cur.y())
+        self.setFocus()
         self.update()
 
     def disarm(self) -> None:
@@ -119,9 +98,8 @@ class Overlay(QWidget):
         self._armed = False
         self._drawing = False
         self._gesture_local.clear()
-        self._sprite = None
         self._engine.set_cursor(QPointF(), active=False)
-        self._engine.particles.clear()
+        self._engine.clear_trail_anchor()
         self.hide()
         self.closed.emit()
 
@@ -136,76 +114,17 @@ class Overlay(QWidget):
         cur = self.mapFromGlobal(QCursor.pos())
         self._engine.set_cursor(QPointF(cur), active=self._armed)
         if self._armed and not self._drawing:
-            self._engine.spawn_trail(cur.x(), cur.y())
+            self._trail_tick += 1
+            if self._trail_tick % 2 == 0:
+                self._engine.spawn_trail(cur.x(), cur.y())
 
-        self._advance_sprite()
         self._engine.tick()
         if self._armed:
             self.update()
 
-    def _toast_show(self, msg: str, seconds: float = 3.0) -> None:
+    def _toast_show(self, msg: str, seconds: float = 2.5) -> None:
         self._toast = msg
         self._toast_timer = seconds
-
-    def _advance_sprite(self) -> None:
-        sp = self._sprite
-        if sp is None:
-            return
-        now = time.monotonic()
-        t = min(1.0, (now - sp.fly_start) / sp.fly_duration)
-        ease = 1.0 - (1.0 - t) ** 3
-        scx = sp.src_x + sp.icon_w / 2
-        scy = sp.src_y + sp.icon_h / 2
-        sp.cur_cx = scx + (sp.dst_cx - scx) * ease
-        sp.cur_cy = scy + (sp.dst_cy - scy) * ease
-        if t >= 1.0 and not sp.vanished:
-            sp.vanished = True
-            filename = Path(sp.hit_path).name
-            if vanish.hide_icon(DESKTOP, filename):
-                audit.log_action("VANISH_OK", f"name={sp.hit_name} path={sp.hit_path}")
-                self._toast_show(f"Stashed {sp.hit_name}")
-            else:
-                self._toast_show(f"Stash failed for {sp.hit_name}")
-            self._sprite = None
-
-    def _start_sprite(
-        self,
-        hit: SlingIconHit,
-        screen_rect: QRectF,
-        dst_cx: int,
-        dst_cy: int,
-        w: int,
-        h: int,
-    ) -> None:
-        pixmap = QPixmap()
-        screen = QGuiApplication.primaryScreen()
-        if screen is not None:
-            grab = screen.grabWindow(
-                0,
-                int(screen_rect.x()),
-                int(screen_rect.y()),
-                max(1, w),
-                max(1, h),
-            )
-            if not grab.isNull():
-                pixmap = grab
-            else:
-                audit.log_debug("SPRITE", "screen grab failed on Wayland — vanish without snapshot")
-
-        src_tl = self.mapFromGlobal(QPoint(int(screen_rect.x()), int(screen_rect.y())))
-        dst_local = self.mapFromGlobal(QPoint(dst_cx, dst_cy))
-        self._sprite = _Sprite(
-            pixmap=pixmap,
-            icon_w=float(w),
-            icon_h=float(h),
-            src_x=float(src_tl.x()),
-            src_y=float(src_tl.y()),
-            dst_cx=float(dst_local.x()),
-            dst_cy=float(dst_local.y()),
-            hit_name=hit.name,
-            hit_path=hit.path,
-            fly_start=time.monotonic(),
-        )
 
     def _draw_cursor_sprite(self, painter: QPainter) -> None:
         if self._ring_pixmap.isNull():
@@ -283,24 +202,6 @@ class Overlay(QWidget):
 
         self._engine.draw(p)
 
-        sp = self._sprite
-        if sp:
-            x = sp.cur_cx - sp.icon_w / 2
-            y = sp.cur_cy - sp.icon_h / 2
-            rect = QRectF(x, y, sp.icon_w, sp.icon_h)
-            if not sp.pixmap.isNull():
-                p.drawPixmap(int(x), int(y), int(sp.icon_w), int(sp.icon_h), sp.pixmap)
-            else:
-                p.setPen(QPen(QColor(255, 200, 60, 220), 2))
-                p.setBrush(QColor(40, 30, 60, 200))
-                p.drawRoundedRect(rect, 8, 8)
-                p.setFont(QFont("Sans", 8, QFont.Weight.Bold))
-                p.setPen(QColor(255, 235, 180))
-                p.drawText(rect.adjusted(4, 4, -4, -4), Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignCenter, sp.hit_name)
-            p.setPen(QPen(QColor(255, 180, 40, 160), 3))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QPointF(sp.cur_cx, sp.cur_cy), 18, 18)
-
         self._draw_cursor_sprite(p)
 
         if self._toast:
@@ -329,7 +230,7 @@ class Overlay(QWidget):
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if not self._armed or event.button() != Qt.MouseButton.LeftButton:
             return
-        if self._busy() or not icon_registry.calibration_ready():
+        if not icon_registry.calibration_ready():
             if not icon_registry.calibration_ready():
                 self._toast_show("⏳ Still calibrating…")
             return
@@ -346,8 +247,7 @@ class Overlay(QWidget):
         if not self._drawing or event.button() != Qt.MouseButton.LeftButton:
             return
         self._drawing = False
-        if not self._busy():
-            self._evaluate()
+        self._evaluate()
         event.accept()
 
     def _evaluate(self) -> None:
@@ -380,8 +280,7 @@ class Overlay(QWidget):
             return
 
         had_stashed = bool(vanish.session_hidden())
-
-        # Hit-test against current on-desktop icons only (stashed items aren't visible)
+        icon_registry.rescan_desktop()
         hit = hit_tester.resolve_hit(result, icon_registry.current_icons())
 
         if isinstance(hit, SlingIconHit):
@@ -389,32 +288,25 @@ class Overlay(QWidget):
             QApplication.clipboard().setText(hit.path)
             audit.log_action("COPIED_TO_CLIPBOARD", f"name='{hit.name}' path='{hit.path}'")
 
-            rx, ry = state.get_ring_pos()
-            dst_x = rx + RING_SIZE // 2
-            dst_y = ry + RING_SIZE // 2
-            rect = QRectF(hit.screen_x, hit.screen_y, hit.width, hit.height)
-            self._toast_show(f"Vanishing {hit.name}…")
-            self._start_sprite(hit, rect, dst_x, dst_y, int(hit.width), int(hit.height))
+            filename = Path(hit.path).name
+            if vanish.hide_icon(DESKTOP, filename):
+                audit.log_action("VANISH_OK", f"name={hit.name} path={hit.path}")
+                self._toast_show(f"Stashed {hit.name}")
+            else:
+                self._toast_show(f"Stash failed for {hit.name}")
             return
 
-        # Empty space: summon stashed icons at portal, or move the ring
         if had_stashed:
             self._last_hit_name = "summon"
-            count = vanish.reveal_all_at(DESKTOP, result.centroid_x, result.centroid_y)
-            self._toast_show(f"Summoned {count} icon(s) at portal")
+            name = vanish.reveal_next_at(DESKTOP, result.centroid_x, result.centroid_y)
+            if name:
+                self._toast_show(f"Summoned {name} at portal")
+            else:
+                self._toast_show("Summon failed")
             return
 
-        if isinstance(hit, MoveRingHit):
-            self._last_hit_name = "move ring"
-            gx = int(hit.target_x) - RING_SIZE // 2
-            gy = int(hit.target_y) - RING_SIZE // 2
-            screen = QGuiApplication.primaryScreen()
-            if screen:
-                g = screen.geometry()
-                gx = max(g.left(), min(g.right() - RING_SIZE, gx))
-                gy = max(g.top(), min(g.bottom() - RING_SIZE, gy))
-            self._toast_show("Ring moved")
-            self.ring_move_requested.emit(gx, gy)
+        self._last_hit_name = "miss"
+        self._toast_show("No icon in the circle — draw around a desktop icon")
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() == Qt.Key.Key_Escape and self._armed:
