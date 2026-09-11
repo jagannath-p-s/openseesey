@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=OpenSesame
+Comment=Sling ring cursor + vanish illusion
+Exec=/home/linux/Desktop/openseesey/.venv/bin/python /home/linux/Desktop/openseesey/main.py
+Icon=/home/linux/Desktop/openseesey/appicon.png
+Terminal=false
+Categories=Utility;
+StartupNotify=true
