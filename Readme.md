@@ -115,8 +115,6 @@ flowchart LR
 ![Screenshot — summon](docs/screenshot-summon.png)
 *Circling empty space summons the next stashed icon at the portal centroid.*
 
-> **Note:** Add your own screenshots to the `docs/` folder and update the paths above before submission.
-
 #### Key modules
 
 | File | Role |
@@ -138,9 +136,9 @@ flowchart LR
 ### Project Demo
 
 #### Video
-[Add your demo video link here — e.g. YouTube or Google Drive]
+**[OpenSesame Demo — demosesame](https://drive.google.com/file/d/1yv2HwmLQF_Zd9I7RgkuONHWc1xpwDJqo/view?usp=sharing)**
 
-*Show: arming the ring → stashing an icon → summoning at a portal → Esc restore all.*
+*Demonstrates arming the sling ring, stashing a desktop icon, summoning it at a portal circle, sparkle effects, chime, and Esc restore.*
 
 #### Additional Demos
 - Live demo on Kali Linux with DING desktop icons
