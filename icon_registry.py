@@ -80,6 +80,7 @@ _calibration_ready = False
 _listeners: list[Callable[[], None]] = []
 _ready_listeners: list[Callable[[], None]] = []
 _restore_lock = threading.Lock()
+_ding_ext_id: str | None = None
 
 
 def ding_extension_id() -> str:
@@ -101,24 +102,31 @@ def ding_extension_id() -> str:
     return _DING_UUID
 
 
+def _cached_ding_id() -> str:
+    global _ding_ext_id
+    if _ding_ext_id is None:
+        _ding_ext_id = ding_extension_id()
+    return _ding_ext_id
+
+
 def reload_ding() -> bool:
     """Force DING full reload — only reliable path for metadata placement."""
-    ext_id = ding_extension_id()
+    ext_id = _cached_ding_id()
     audit.log_debug("DING", f"reload start id={ext_id}")
     try:
         r_disable = subprocess.run(
             [_GNOME_EXT, "disable", ext_id],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=8,
             check=False,
         )
-        time.sleep(0.15)
+        time.sleep(0.08)
         r_enable = subprocess.run(
             [_GNOME_EXT, "enable", ext_id],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=8,
             check=False,
         )
         ok = r_disable.returncode == 0 and r_enable.returncode == 0
@@ -166,27 +174,30 @@ def _atspi_available() -> bool:
     return _atspi_works
 
 
-def wait_for_ding_ready(timeout_s: float = 3.0, min_icons: int = 1) -> bool:
-    """Poll until DING has repainted — GIO scan (fast), AT-SPI when available."""
+def wait_for_ding_ready(
+    timeout_s: float = 2.5,
+    min_icons: int = 1,
+    *,
+    fast: bool = False,
+) -> bool:
+    """Poll until DING has repainted — file count only (registry rebuilt separately)."""
     deadline = time.monotonic() + timeout_s
-    time.sleep(0.08)
+    time.sleep(0.04)
     while time.monotonic() < deadline:
         gio_count = _count_visible_icons()
         if gio_count >= min_icons:
             audit.log_debug("DING", f"ready via gio scan icons={gio_count} min={min_icons}")
-            _rebuild_registry()
             return True
 
-        if _atspi_available():
+        if not fast and _atspi_available():
             atspi = _run_atspi()
             if len(atspi) >= min_icons:
                 global _atspi_rects
                 _atspi_rects = atspi
                 audit.log_debug("DING", f"ready icons={len(atspi)} min={min_icons}")
-                _rebuild_registry()
                 return True
 
-        time.sleep(0.05)
+        time.sleep(0.03)
 
     audit.log_debug("DING", f"wait timeout min_icons={min_icons}")
     return False
@@ -247,6 +258,17 @@ def refresh_after_hidden_change() -> None:
 
 def rescan_desktop() -> None:
     _rebuild_registry()
+
+
+def remove_icon(path: str) -> None:
+    with _lock:
+        _registry.pop(path, None)
+
+
+def upsert_icon(path: Path, gio_x: int, gio_y: int) -> None:
+    info = _icon_from_path(path, (float(gio_x), float(gio_y)))
+    with _lock:
+        _registry[info.path] = info
     _notify()
 
 
@@ -336,31 +358,41 @@ def _match_atspi(name: str, basename: str, atspi: dict[str, tuple[float, float, 
     return None
 
 
+def _icon_from_path(path: Path, gio: tuple[float, float]) -> IconInfo:
+    gx, gy = gio
+    name = _display_name(path)
+    sx, sy, w, h = gio_to_screen(gx, gy)
+    return IconInfo(
+        path=str(path),
+        name=name,
+        gio_x=gx,
+        gio_y=gy,
+        screen_x=sx,
+        screen_y=sy,
+        width=w,
+        height=h,
+    )
+
+
 def _rebuild_registry(log: bool = False) -> None:
     global _registry
-    new: dict[str, IconInfo] = {}
     hidden = _hidden_filenames()
+    paths = [p for p in _scan_paths() if p.name not in hidden]
+    new: dict[str, IconInfo] = {}
 
-    for path in _scan_paths():
-        if path.name in hidden:
-            continue
+    def read_one(path: Path) -> tuple[str, IconInfo] | None:
         gio = _read_gio(path)
         if gio is None:
-            continue
-        gx, gy = gio
-        name = _display_name(path)
-        sx, sy, w, h = gio_to_screen(gx, gy)
+            return None
+        info = _icon_from_path(path, gio)
+        return info.path, info
 
-        new[str(path)] = IconInfo(
-            path=str(path),
-            name=name,
-            gio_x=gx,
-            gio_y=gy,
-            screen_x=sx,
-            screen_y=sy,
-            width=w,
-            height=h,
-        )
+    workers = min(12, max(4, len(paths)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for result in pool.map(read_one, paths, chunksize=1):
+            if result is not None:
+                path_str, info = result
+                new[path_str] = info
 
     with _lock:
         _registry = new

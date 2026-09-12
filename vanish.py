@@ -80,15 +80,13 @@ def _apply_ding_reload(min_icons: int | None = None) -> bool:
     expected = min_icons if min_icons is not None else max(1, len(icon_registry.current_icons()))
     if not icon_registry.reload_ding():
         return False
-    icon_registry.wait_for_ding_ready(min_icons=expected)
-    icon_registry.rescan_desktop()
-    return True
+    return icon_registry.wait_for_ding_ready(min_icons=expected, fast=True)
 
 
 def _rollback_to_stash(dst: Path, stash: Path) -> None:
     if dst.exists() and stash.parent.exists():
         icon_registry.gio_move(dst, stash)
-    icon_registry.rescan_desktop()
+    icon_registry.remove_icon(str(dst))
 
 
 def _ding_place(dst: Path, gio_x: int, gio_y: int, *, attempts: int = 2) -> tuple[int, int] | None:
@@ -124,12 +122,11 @@ def _restore_via_gio(
         if not icon_registry.gio_move(stash, dst):
             return False
 
-        # Overwrite stale xattr from the pre-stash desktop path before DING sees the file.
-        icon_registry.set_icon_position(str(dst), gio_x, gio_y)
         final = _ding_place(dst, gio_x, gio_y)
 
         ok = final == (gio_x, gio_y)
         if final:
+            icon_registry.upsert_icon(dst, final[0], final[1])
             sx, sy, _, _ = icon_registry.gio_to_screen(float(final[0]), float(final[1]))
             note = f"intended=({gio_x},{gio_y}) read={final} screen=({sx:.0f},{sy:.0f}) ok={ok}"
             if portal_cx is not None and portal_cy is not None:
@@ -187,7 +184,7 @@ def hide_icon(desktop_dir: Path, filename: str) -> bool:
         _hide_queue.append(filename)
 
     _save_persisted()
-    icon_registry.rescan_desktop()
+    icon_registry.remove_icon(str(src))
     audit.log_action("STASH_ICON", f"name={filename} stash={stash_path}")
     return True
 
@@ -249,7 +246,6 @@ def reveal_icon(
     _session.pop(filename, None)
     _remove_from_queue(filename)
     _save_persisted()
-    icon_registry.rescan_desktop()
     audit.log_action(
         "RESTORE_ICON",
         f"name={filename} portal=({portal_cx:.0f},{portal_cy:.0f})"

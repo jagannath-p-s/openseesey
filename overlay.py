@@ -4,10 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
-    QCursor,
     QFont,
     QGuiApplication,
     QKeyEvent,
@@ -30,7 +29,8 @@ from sparks import SparkEngine
 from state import GestureResult, SlingIconHit
 
 ASSET_DIR = Path(__file__).resolve().parent
-CURSOR_SPRITE_SIZE = 28
+CURSOR_SPRITE_SIZE = 52
+CURSOR_HALO = 88
 DESKTOP = Path.home() / "Desktop"
 
 
@@ -65,6 +65,15 @@ class Overlay(QWidget):
         self._summon_worker: _SummonWorker | None = None
         self._engine = SparkEngine()
         self._ring_pixmap = QPixmap(str(ASSET_DIR / "appicon.png"))
+        self._cursor_sprite = self._ring_pixmap.scaled(
+            CURSOR_SPRITE_SIZE,
+            CURSOR_SPRITE_SIZE,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._cursor_local = QPointF()
+        self._prev_cursor_local = QPointF()
+        self._full_repaint = False
 
         self.setWindowTitle("OpenSesame")
         self.setMouseTracking(True)
@@ -75,12 +84,12 @@ class Overlay(QWidget):
             | Qt.WindowType.Tool,
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
 
         self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(16)
-
-        icon_registry.on_ready(self.update)
+        self._timer.start(8)
 
     def is_armed(self) -> bool:
         return self._armed
@@ -91,6 +100,7 @@ class Overlay(QWidget):
             self.setGeometry(screen.geometry())
         self._armed = True
         self._gesture_local.clear()
+        self._full_repaint = True
         self._engine.clear_trail_anchor()
         QGuiApplication.setOverrideCursor(Qt.CursorShape.BlankCursor)
         self.show()
@@ -113,64 +123,94 @@ class Overlay(QWidget):
         self.hide()
         self.closed.emit()
 
+    def _cursor_dirty_rect(self) -> QRect:
+        r = CURSOR_HALO + CURSOR_SPRITE_SIZE
+        rects: list[QRect] = []
+        for pt in (self._cursor_local, self._prev_cursor_local):
+            cx = int(pt.x())
+            cy = int(pt.y())
+            rects.append(QRect(cx - r, cy - r, r * 2, r * 2))
+        out = rects[0]
+        for rc in rects[1:]:
+            out = out.united(rc)
+        return out
+
+    def _schedule_repaint(self, *, full: bool = False) -> None:
+        if full:
+            self._full_repaint = True
+            self.update()
+            return
+        if self._drawing or self._fade > 0 or self._engine.has_active_fx():
+            self._full_repaint = True
+            self.update()
+        else:
+            self.update(self._cursor_dirty_rect())
+
     def _tick(self) -> None:
+        if not self._armed:
+            return
+
         if self._fade > 0:
-            self._fade = max(0.0, self._fade - 0.018)
+            self._fade = max(0.0, self._fade - 0.02)
         if self._toast_timer > 0:
-            self._toast_timer = max(0.0, self._toast_timer - 0.016)
+            self._toast_timer = max(0.0, self._toast_timer - 0.008)
             if self._toast_timer <= 0:
                 self._toast = ""
 
-        cur = self.mapFromGlobal(QCursor.pos())
-        self._engine.set_cursor(QPointF(cur), active=self._armed)
-        self._engine.tick()
-        if self._armed:
+        animating = self._engine.tick()
+        if self._drawing or self._fade > 0 or animating or self._toast:
+            self._full_repaint = True
             self.update()
+        else:
+            self.update(self._cursor_dirty_rect())
 
     def _toast_show(self, msg: str, seconds: float = 2.2) -> None:
         self._toast = msg
         self._toast_timer = seconds
+        self._schedule_repaint(full=True)
 
     def _portal_local(self, result: GestureResult) -> QPointF:
         gp = QPoint(int(result.centroid_x), int(result.centroid_y))
-        lp = self.mapFromGlobal(gp)
-        return QPointF(lp)
+        return QPointF(self.mapFromGlobal(gp))
 
     def _celebrate_circle(self, result: GestureResult) -> None:
         lc = self._portal_local(result)
         self._engine.trigger_circle_burst(lc.x(), lc.y(), result.radius)
         sfx.play_circle_chime()
+        self._schedule_repaint(full=True)
 
     def _draw_cursor_sprite(self, painter: QPainter) -> None:
-        if self._ring_pixmap.isNull():
+        if self._cursor_sprite.isNull():
             return
-        cur = self.mapFromGlobal(QCursor.pos())
-        scaled = self._ring_pixmap.scaled(
-            CURSOR_SPRITE_SIZE,
-            CURSOR_SPRITE_SIZE,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        x = int(cur.x() - scaled.width() / 2)
-        y = int(cur.y() - scaled.height() / 2)
-        painter.drawPixmap(x, y, scaled)
+        cx = self._cursor_local.x()
+        cy = self._cursor_local.y()
+        x = int(cx - self._cursor_sprite.width() / 2)
+        y = int(cy - self._cursor_sprite.height() / 2)
+        painter.drawPixmap(x, y, self._cursor_sprite)
 
     def paintEvent(self, event: QPaintEvent) -> None:
         if not self._armed:
             return
 
+        full = self._full_repaint or event.rect().width() > CURSOR_HALO * 3
+        self._full_repaint = False
+
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        p.fillRect(self.rect(), QColor(0, 0, 0, 1))
+        if full:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.fillRect(self.rect(), QColor(0, 0, 0, 1))
+        else:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            p.fillRect(event.rect(), QColor(0, 0, 0, 1))
 
         if not icon_registry.calibration_ready():
             p.setFont(QFont("Sans", 14, QFont.Weight.Bold))
             p.setPen(QColor(255, 200, 80))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Calibrating desktop icons…")
 
-        if self._fade > 0 and len(self._last_local) > 1:
-            alpha = int(180 * self._fade / 1.6)
-            pen = QPen(QColor(255, 215, 50, alpha), 3, Qt.PenStyle.SolidLine)
+        if full and self._fade > 0 and len(self._last_local) > 1:
+            alpha = int(200 * self._fade / 1.6)
+            pen = QPen(QColor(255, 215, 50, alpha), 5, Qt.PenStyle.SolidLine)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             p.setPen(pen)
             path = QPainterPath()
@@ -181,12 +221,12 @@ class Overlay(QWidget):
 
             if self._last_result:
                 lc = self._portal_local(self._last_result)
-                r = max(20.0, self._last_result.radius)
+                r = max(28.0, self._last_result.radius * 1.1)
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawEllipse(QRectF(lc.x() - r, lc.y() - r, r * 2, r * 2))
 
-        if len(self._gesture_local) > 1:
-            pen = QPen(QColor(255, 215, 50, 230), 4)
+        if full and len(self._gesture_local) > 1:
+            pen = QPen(QColor(255, 215, 50, 240), 7)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             p.setPen(pen)
             path = QPainterPath()
@@ -195,10 +235,12 @@ class Overlay(QWidget):
                 path.lineTo(pt)
             p.drawPath(path)
 
+        if full:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         self._engine.draw(p)
         self._draw_cursor_sprite(p)
 
-        if self._toast:
+        if full and self._toast:
             p.setFont(QFont("Sans", 11, QFont.Weight.Bold))
             tw = p.fontMetrics().horizontalAdvance(self._toast) + 32
             tr = QRectF((self.width() - tw) / 2, self.height() - 100, tw, 36)
@@ -216,19 +258,29 @@ class Overlay(QWidget):
         if not icon_registry.calibration_ready():
             self._toast_show("⏳ Still calibrating…")
             return
+        self._cursor_local = event.position()
+        self._engine.set_cursor(self._cursor_local, active=True)
         self._drawing = True
         self._stroke_step = 0
         self._gesture_local = [event.position()]
         self._engine.spawn_stroke_spark(event.position().x(), event.position().y())
+        self._schedule_repaint(full=True)
         event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if not self._armed:
+            return
+        self._prev_cursor_local = self._cursor_local
+        self._cursor_local = event.position()
+        self._engine.set_cursor(self._cursor_local, active=True)
         if not self._drawing:
+            self._schedule_repaint()
             return
         self._gesture_local.append(event.position())
         self._stroke_step += 1
         if self._stroke_step % 2 == 0:
             self._engine.spawn_stroke_spark(event.position().x(), event.position().y())
+        self._schedule_repaint(full=True)
         event.accept()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
@@ -259,6 +311,7 @@ class Overlay(QWidget):
         self._last_result = result
         if not result.is_circle:
             self._toast_show(f"Not a circle: {result.reason}")
+            self._schedule_repaint(full=True)
             return
 
         if not icon_registry.calibration_ready():
@@ -286,7 +339,7 @@ class Overlay(QWidget):
                 self._toast_show("Summon already in progress…")
                 return
             self._summon_busy = True
-            self._toast_show("Summoning…", seconds=8.0)
+            self._toast_show("Summoning…", seconds=6.0)
             worker = _SummonWorker(result.centroid_x, result.centroid_y)
             worker.done.connect(self._on_summon_done)
             self._summon_worker = worker
